@@ -1,0 +1,193 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+import time
+import csv
+import os
+import re
+
+# --- CONFIGURACIÓN DEL DRIVER ---
+options = Options()
+options.add_argument("--start-maximized")
+driver = webdriver.Chrome(options=options)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def normalizar_url(url):
+    url = url.strip()
+    if not url:
+        return ""
+    if "/matchups/" not in url:
+        if url.endswith("/"):
+            url = f"{url}matchups/#all"
+        else:
+            url = f"{url}/matchups/#all"
+    return url
+
+
+def obtener_liga_desde_url(url):
+    partes = url.split("/soccer/")
+    if len(partes) < 2:
+        return ""
+    resto = partes[1]
+    liga = resto.split("/")[0]
+    return liga.replace("-", " ").strip()
+
+
+DATE_RE = r"\b\d{1,2}/\d{1,2}/\d{4}\b"
+DATETIME_RE = r"\b\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\b"
+TIME_RE = r"\b\d{1,2}:\d{2}\b"
+DATE_TEXT_RE = r"\b(?:[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{3}\s*,\s*)?\d{1,2}\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+\.?\s+\d{4}\b"
+
+
+def buscar_fecha_cercana(partido):
+    # Busca un encabezado de fecha anterior cercano en el DOM
+    candidatos = partido.find_elements(
+        By.XPATH,
+        "preceding::*[self::div or self::span or self::h3][position() <= 60]"
+    )
+    for elem in candidatos:
+        texto = elem.text.strip()
+        if not texto:
+            continue
+        match = re.search(DATE_RE, texto)
+        if match:
+            return match.group(0)
+        match = re.search(DATE_TEXT_RE, texto)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def buscar_fecha_datebar(partido):
+    # Busca el dateBar más cercano anterior al partido
+    try:
+        elem = partido.find_element(
+            By.XPATH,
+            "preceding::div[@data-test-id='Events.DateBar'][1]/span"
+        )
+        texto = elem.text.strip()
+        if texto:
+            return texto
+    except Exception:
+        pass
+    return ""
+
+
+def extraer_fecha(partido):
+    # Intenta obtener la fecha del elemento estándar
+    try:
+        fecha_elem = partido.find_element(By.CSS_SELECTOR, "div.matchupDate-tnomIYorwa")
+        fecha_raw = fecha_elem.text.strip()
+    except Exception:
+        fecha_raw = ""
+
+    # Extraer solo la fecha/hora limpia si hay texto extra (+mercados)
+    match = re.search(DATETIME_RE, fecha_raw)
+    if match:
+        return match.group(0)
+
+    # Si solo hay hora, buscar fecha en dateBar/encabezado cercano y combinar
+    time_match = re.search(TIME_RE, fecha_raw)
+    if time_match:
+        fecha_header = buscar_fecha_datebar(partido) or buscar_fecha_cercana(partido)
+        if fecha_header:
+            return f"{fecha_header} {time_match.group(0)}"
+
+    # Fallback: buscar fecha+hora o fecha en todo el bloque del partido
+    match = re.search(DATETIME_RE, partido.text)
+    if match:
+        return match.group(0)
+    match = re.search(DATE_RE, partido.text)
+    if match and time_match:
+        return f"{match.group(0)} {time_match.group(0)}"
+    match = re.search(DATE_TEXT_RE, partido.text)
+    if match and time_match:
+        return f"{match.group(0)} {time_match.group(0)}"
+
+    return fecha_raw
+
+urls_path = os.path.join(BASE_DIR, "data", "raw", "pinnacle_urls_per_ligue.txt")
+with open(urls_path, "r", encoding="utf-8") as f:
+    urls = [normalizar_url(line) for line in f.readlines()]
+urls = [u for u in urls if u]
+
+# Crear CSV
+output_csv = os.path.join(BASE_DIR, "cuotas_pinnacle.csv")
+with open(output_csv, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Liga", "URL", "Local", "Visitante", "Fecha", "Cuota_Local", "Cuota_Empate", "Cuota_Visitante"])
+
+    vistos = set()
+    for url in urls:
+        liga = obtener_liga_desde_url(url)
+        driver.get(url)
+        time.sleep(6)
+
+        # --- CARGAR TODO CON SCROLL ---
+        max_rounds = 40
+        same_count_rounds = 0
+        last_count = 0
+        for _ in range(max_rounds):
+            botones_mas = driver.find_elements(
+                By.XPATH,
+                "//button[contains(., 'Mostrar más') or contains(., 'Show more')]"
+            )
+            for b in botones_mas:
+                try:
+                    b.click()
+                    time.sleep(1)
+                except Exception:
+                    pass
+
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            count = len(driver.find_elements(By.CSS_SELECTOR, "div.row-u9F3b9WCM3"))
+            if count == last_count:
+                same_count_rounds += 1
+            else:
+                same_count_rounds = 0
+                last_count = count
+            if same_count_rounds >= 3:
+                break
+
+        # --- EXTRAER TODOS LOS PARTIDOS EN LA PÁGINA ---
+        partidos = driver.find_elements(By.CSS_SELECTOR, "div.row-u9F3b9WCM3")
+        for partido in partidos:
+            try:
+                # Equipos
+                teams = partido.find_elements(By.CSS_SELECTOR, "span.ellipsis.gameInfoLabel-EDDYv5xEfd")
+                if len(teams) < 2:
+                    continue  # saltar si no hay equipos visibles
+                equipo_local = teams[0].text
+                equipo_visitante = teams[1].text
+
+                # Fecha
+                fecha = extraer_fecha(partido)
+
+                # Cuotas 1X2 (moneyline)
+                cuotas_moneyline = partido.find_elements(By.CSS_SELECTOR, "div[data-test-id='moneyline'] span.price-r5BU0ynJha")
+                if len(cuotas_moneyline) < 3:
+                    continue  # saltar si faltan cuotas
+                cuota_local = cuotas_moneyline[0].text
+                cuota_empate = cuotas_moneyline[1].text
+                cuota_visitante = cuotas_moneyline[2].text
+
+                # Evitar duplicados
+                hrefs = partido.find_elements(By.CSS_SELECTOR, "a[href*='/soccer/']")
+                href = hrefs[0].get_attribute("href") if hrefs else ""
+                clave = (href or "", equipo_local, equipo_visitante, fecha, url)
+                if clave in vistos:
+                    continue
+                vistos.add(clave)
+
+                # Escribir en CSV
+                writer.writerow([liga, url, equipo_local, equipo_visitante, fecha, cuota_local, cuota_empate, cuota_visitante])
+
+                # Mostrar en pantalla
+                print(f"[{liga}] {equipo_local} vs {equipo_visitante} | {fecha} | {cuota_local}-{cuota_empate}-{cuota_visitante}")
+
+            except Exception as e:
+                print("Error extrayendo partido:", e)
+                continue
+
+driver.quit()
